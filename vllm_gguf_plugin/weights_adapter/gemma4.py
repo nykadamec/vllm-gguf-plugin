@@ -245,8 +245,10 @@ class Gemma4GGUFAdapter(BaseGGUFWeightsAdapter):
             if name in flatten_names:
                 weight = weight.flatten(1)
             if name == "model.vision_embedder.pos_embedding":
-                # GGUF stores the factorized 2D positional table as
-                # [mm_embed_dim, mm_posemb_size, 2]; HF expects
-                # [mm_posemb_size, 2, mm_embed_dim]. Same numel, different order.
-                weight = weight.permute(1, 2, 0).contiguous()
+                # vLLM allocates [mm_posemb_size, 2, mm_embed_dim] = [1120, 2, 3840].
+                # The tensor handed to transform_weights is [1120, 3840, 2], not the
+                # raw GGUF header order [3840, 1120, 2]: the plugin's GGUF linear
+                # path has already moved mm_embed_dim to the end. Only the two
+                # remaining axes need swapping.
+                weight = weight.permute(1, 0, 2).contiguous()
             yield from self._split_expert_weights(name, weight)
