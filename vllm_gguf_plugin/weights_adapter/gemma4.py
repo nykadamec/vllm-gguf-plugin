@@ -92,17 +92,68 @@ def build_gemma4_vision_mapper() -> WeightsMapper:
     )
 
 
+def build_gemma4_unified_text_mapper() -> WeightsMapper:
+    """Text mapper for the encoder-free ``gemma4_unified`` variant.
+
+    Same GGUF tensor names as the tower-based variant, but the checkpoint
+    nests the language model under ``model.language_model.*`` and has no
+    ``lm_head`` (weights are tied to the embedding), matching
+    ``Gemma4UnifiedForConditionalGeneration.hf_to_vllm_mapper`` in vLLM.
+    """
+    return WeightsMapper(
+        orig_to_new_prefix={
+            "token_embd.": "model.language_model.embed_tokens.",
+            "blk.": "model.language_model.layers.",
+            "output_norm.": "model.language_model.norm.",
+        },
+        orig_to_new_substr=GEMMA4_TEXT_SUBSTR,
+    )
+
+
+def build_gemma4_unified_vision_mapper() -> WeightsMapper:
+    """Vision mapper for ``gemma4_unified``.
+
+    ``gemma4_unified`` is encoder-free: there is no ``vision_tower``, so the
+    GGUF ``v.*`` tensors feed ``Gemma4UnifiedVisionEmbedder`` and ``mm.*``
+    feed the two ``Gemma4MultimodalEmbedder`` instances.
+    """
+    return WeightsMapper(
+        orig_to_new_prefix={
+            "v.patch_embd.weight": "model.vision_embedder.patch_dense.weight",
+            "v.patch_embd.bias": "model.vision_embedder.patch_dense.bias",
+            "v.patch_norm.1.weight": "model.vision_embedder.patch_ln1.weight",
+            "v.patch_norm.1.bias": "model.vision_embedder.patch_ln1.bias",
+            "v.patch_norm.2.weight": "model.vision_embedder.patch_ln2.weight",
+            "v.patch_norm.2.bias": "model.vision_embedder.patch_ln2.bias",
+            "v.patch_norm.3.weight": "model.vision_embedder.pos_norm.weight",
+            "v.patch_norm.3.bias": "model.vision_embedder.pos_norm.bias",
+            "v.position_embd.weight": "model.vision_embedder.pos_embedding",
+            "mm.input_projection": "model.embed_vision.embedding_projection",
+            "mm.a.input_projection": "model.embed_audio.embedding_projection",
+        },
+    )
+
+
 def _map_tensor_name(mapper: WeightsMapper, name: str) -> str | None:
     mapped = mapper.apply_list([name])[0]
     return mapped if mapped != name else None
 
 
 class Gemma4GGUFAdapter(BaseGGUFWeightsAdapter):
-    """Adapter for Gemma 4 text and multimodal GGUF models."""
+    """Adapter for Gemma 4 text and multimodal GGUF models.
+
+    Handles both the tower-based ``gemma4`` and the encoder-free
+    ``gemma4_unified`` variant. The two share GGUF tensor names but nest
+    them differently in the HF checkpoint.
+    """
 
     @classmethod
     def matches(cls, config) -> bool:
-        return config.model_type == "gemma4"
+        return config.model_type in ("gemma4", "gemma4_unified")
+
+    @staticmethod
+    def is_unified(config) -> bool:
+        return config.model_type == "gemma4_unified"
 
     def patch_hf_config(
         self,
@@ -115,23 +166,22 @@ class Gemma4GGUFAdapter(BaseGGUFWeightsAdapter):
             mmproj_path=files.mm_proj,
         )
 
-    @staticmethod
-    def map_name(name: str) -> str | None:
-        mapper = (
-            build_gemma4_vision_mapper()
-            if name.startswith(("v.", "mm."))
-            else build_gemma4_text_mapper()
-        )
-        return _map_tensor_name(mapper, name)
-
     def build_name_map(
         self,
         files: GGUFModelFiles,
         model_config: ModelConfig,
     ) -> dict[str, str]:
-        del model_config
-        text_mapper = build_gemma4_text_mapper()
-        vision_mapper = build_gemma4_vision_mapper()
+        unified = self.is_unified(model_config.hf_config)
+        text_mapper = (
+            build_gemma4_unified_text_mapper()
+            if unified
+            else build_gemma4_text_mapper()
+        )
+        vision_mapper = (
+            build_gemma4_unified_vision_mapper()
+            if unified
+            else build_gemma4_vision_mapper()
+        )
         name_map: dict[str, str] = {}
         unmapped: list[str] = []
         for name in sorted(get_gguf_tensor_names(files.all_files)):
@@ -180,8 +230,16 @@ class Gemma4GGUFAdapter(BaseGGUFWeightsAdapter):
         weights: Iterable[GGUFWeight],
         model_config: ModelConfig,
     ) -> Iterable[GGUFWeight]:
-        del model_config
+        # gemma4_unified's patch projection is a plain Linear built from raw pixel
+        # patches, so the GGUF 3-D [out, h, w] tensor has to be flattened to 2-D.
+        # The tower-based variant does the same for its input_proj.
+        unified = self.is_unified(model_config.hf_config)
+        flatten_names = (
+            {"model.vision_embedder.patch_dense.weight"}
+            if unified
+            else {"model.vision_tower.patch_embedder.input_proj.weight"}
+        )
         for name, weight in weights:
-            if name == "model.vision_tower.patch_embedder.input_proj.weight":
+            if name in flatten_names:
                 weight = weight.flatten(1)
             yield from self._split_expert_weights(name, weight)
