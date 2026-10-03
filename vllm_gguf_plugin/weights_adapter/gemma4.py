@@ -234,6 +234,8 @@ class Gemma4GGUFAdapter(BaseGGUFWeightsAdapter):
         # patches, so the GGUF 3-D [out, h, w] tensor has to be flattened to 2-D.
         # The tower-based variant does the same for its input_proj.
         unified = self.is_unified(model_config.hf_config)
+        # Both variants feed their vision patch projection a GGUF conv-shaped
+        # tensor that flattens to 2-D; only the target parameter name differs.
         flatten_names = (
             {"model.vision_embedder.patch_dense.weight"}
             if unified
@@ -242,4 +244,9 @@ class Gemma4GGUFAdapter(BaseGGUFWeightsAdapter):
         for name, weight in weights:
             if name in flatten_names:
                 weight = weight.flatten(1)
+            if name == "model.vision_embedder.pos_embedding":
+                # GGUF stores the factorized 2D positional table as
+                # [mm_embed_dim, mm_posemb_size, 2]; HF expects
+                # [mm_posemb_size, 2, mm_embed_dim]. Same numel, different order.
+                weight = weight.permute(1, 2, 0).contiguous()
             yield from self._split_expert_weights(name, weight)
